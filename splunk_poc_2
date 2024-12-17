@@ -1,0 +1,128 @@
+import json
+import requests
+import os
+import time
+import logging
+from datetime import datetime
+import argparse
+import sys
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Splunk configuration (use environment variables for production, defaults provided)
+SPLUNK_HOST = os.environ.get("SPLUNK_HOST")
+if SPLUNK_HOST and not SPLUNK_HOST.startswith(('http://', 'https://')):
+    logging.error("Invalid SPLUNK_HOST. Must be a valid URL or IP address.")
+    sys.exit(1)
+
+SPLUNK_PORT = os.environ.get("SPLUNK_PORT", "8088")
+SPLUNK_TOKEN = os.environ.get("SPLUNK_TOKEN")
+SPLUNK_INDEX = os.environ.get("SPLUNK_INDEX", "main")
+SPLUNK_SOURCE = os.environ.get("SPLUNK_SOURCE", "python_script")
+SPLUNK_SOURCETYPE = os.environ.get("SPLUNK_SOURCETYPE", "json")
+SPLUNK_VERIFY_SSL = os.environ.get("SPLUNK_VERIFY_SSL", "True").lower() == "true"
+
+# Check for required environment variables
+if not all([SPLUNK_HOST, SPLUNK_TOKEN]):
+    logging.error("SPLUNK_HOST and SPLUNK_TOKEN environment variables must be set.")
+    sys.exit(1)
+
+def send_to_splunk(event, timestamp=None):
+    """Sends an event to Splunk via HEC."""
+    headers = {
+        "Authorization": f"Splunk {SPLUNK_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "event": event,
+        "index": SPLUNK_INDEX,
+        "source": SPLUNK_SOURCE,
+        "sourcetype": SPLUNK_SOURCETYPE
+    }
+
+    if timestamp:
+        payload["time"] = timestamp
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                f"https://{SPLUNK_HOST}:{SPLUNK_PORT}/services/collector/event",
+                headers=headers,
+                json=payload,
+                verify=SPLUNK_VERIFY_SSL,
+                timeout=10
+            )
+            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+            logging.debug(f"Sent payload: {payload}")
+            logging.info(f"Successfully sent event to Splunk. Status Code: {response.status_code}")
+            return True
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Attempt {attempt + 1} of {max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                logging.error("All attempts to send event to Splunk failed.")
+                return False
+
+def process_json_file(file_path):
+    """Reads a JSON file and sends each object to Splunk."""
+    try:
+        with open(file_path, "r") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, dict):
+                        timestamp = extract_timestamp(data)
+                        send_to_splunk(data, timestamp)
+                    else:
+                        logging.error(f"Error: JSON data is not a dictionary. Data type: {type(data)}")
+                except json.JSONDecodeError as e:
+                    logging.error(f"Error decoding JSON in file {file_path}: {e}")
+    except FileNotFoundError:
+        logging.error(f"Error: File not found: {file_path}")
+        alternative_path = input("Please provide an alternative file path: ")
+        if os.path.isfile(alternative_path):
+            process_json_file(alternative_path)
+        else:
+            logging.error(f"File not found at provided path: {alternative_path}")
+
+def extract_timestamp(data_item):
+    """Extracts timestamp from 'createdAt' field with improved error handling."""
+    possible_formats = [
+        "%Y-%m-%dT%H:%M:%S.%fZ",  # ISO 8601 format with milliseconds
+        "%Y-%m-%dT%H:%M:%SZ",      # ISO 8601 without milliseconds
+        "%Y-%m-%d %H:%M:%S",       # Common datetime format
+        "%m/%d/%Y %H:%M:%S"        # US format
+    ]
+    if "createdAt" in data_item:
+        for fmt in possible_formats:
+            try:
+                dt_object = datetime.strptime(data_item["createdAt"], fmt)
+                return int(dt_object.timestamp())
+            except ValueError:
+                continue
+        logging.warning(f"Invalid createdAt format: {data_item['createdAt']}. Skipping timestamp.")
+    return None
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Send JSON data to Splunk via HEC.\n\nExample usage:\n  python splunk_hec_client.py /path/to/file.json -i my_index -st my_sourcetype", formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("file_path", help="Path to the JSON file.")
+    parser.add_argument("-i", "--index", help="Splunk index (overrides environment variable)", default=None)
+    parser.add_argument("-st", "--sourcetype", help="Splunk sourcetype (overrides environment variable)", default=None)
+    args = parser.parse_args()
+
+    if args.index:
+        SPLUNK_INDEX = args.index
+        logging.info(f"Overriding Splunk index with command line argument: {SPLUNK_INDEX}")
+        # Validate the provided index
+        if not SPLUNK_INDEX.isalnum():
+            logging.error("Invalid Splunk index. The index must be alphanumeric.")
+            sys.exit(1)
+    if args.sourcetype:
+        SPLUNK_SOURCETYPE = args.sourcetype
+        logging.info(f"Overriding Splunk sourcetype with command line argument: {SPLUNK_SOURCETYPE}")
+
+    process_json_file(args.file_path)
