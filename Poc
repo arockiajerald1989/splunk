@@ -1,0 +1,127 @@
+import json
+import os
+import requests
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class SplunkHECClient:
+    def __init__(self, splunk_url: str, hec_token: str):
+        """
+        Initialize the Splunk HEC Client.
+        
+        :param splunk_url: The base URL of the Splunk HEC endpoint.
+        :param hec_token: The HEC token for authentication.
+        """
+        self.splunk_url = splunk_url.rstrip('/') + '/services/collector/event'
+        self.hec_token = hec_token
+        self.headers = {
+            'Authorization': f'Splunk {self.hec_token}',
+            'Content-Type': 'application/json'
+        }
+
+    def post_to_splunk(self, payload: str):
+        """
+        Posts a JSON payload to Splunk.
+        
+        :param payload: The JSON string to send to Splunk.
+        """
+        try:
+            response = requests.post(self.splunk_url, headers=self.headers, data=payload)
+            if response.status_code == 200:
+                logging.info('Successfully posted data to Splunk.')
+            else:
+                logging.error(f'Failed to post data to Splunk. Status code: {response.status_code}, Response: {response.text}')
+        except requests.exceptions.RequestException as e:
+            logging.error(f'Request failed: {e}')
+
+
+def read_json_file(file_path: str) -> dict:
+    """
+    Reads a JSON file and returns the content as a dictionary.
+    
+    :param file_path: Path to the JSON file.
+    :return: The content of the JSON file as a dictionary.
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            data = json.load(file)
+        logging.info(f'Successfully read JSON file: {file_path}')
+        return data
+    except Exception as e:
+        logging.error(f'Error reading JSON file: {e}')
+        raise
+
+
+def chunk_json_data(data: dict, chunk_size: int = 128 * 1024) -> list:
+    """
+    Chunk a JSON object into multiple parts if its string size exceeds the given limit.
+    
+    :param data: The JSON object to be chunked.
+    :param chunk_size: The size (in bytes) of each chunk. Default is 128 KB.
+    :return: A list of JSON string chunks.
+    """
+    try:
+        json_str = json.dumps(data)
+        data_size = len(json_str)
+        
+        if data_size <= chunk_size:
+            logging.info('JSON data is within the size limit. No chunking required.')
+            return [json_str]
+        
+        chunks = []
+        start_index = 0
+        while start_index < data_size:
+            end_index = start_index + chunk_size
+            chunk = json_str[start_index:end_index]
+            
+            # Ensure the chunk is valid JSON
+            if start_index != 0:
+                chunk = '{' + chunk.split('{', 1)[-1]  # Ensure chunk starts with a valid JSON start
+            if end_index < data_size:
+                chunk = chunk.rsplit('}', 1)[0] + '}'  # Ensure chunk ends with a valid JSON end
+            
+            chunks.append(chunk)
+            start_index = end_index
+            
+        logging.info(f'JSON data chunked into {len(chunks)} parts.')
+        return chunks
+    except Exception as e:
+        logging.error(f'Error while chunking JSON data: {e}')
+        raise
+
+
+def main(file_path: str, splunk_url: str, hec_token: str):
+    """
+    Main function to read, chunk, and post JSON data to Splunk.
+    
+    :param file_path: Path to the JSON file.
+    :param splunk_url: The Splunk HEC URL.
+    :param hec_token: The Splunk HEC token.
+    """
+    try:
+        # Step 1: Read the JSON file
+        json_data = read_json_file(file_path)
+        
+        # Step 2: Chunk the JSON data if it's larger than 128 KB
+        json_chunks = chunk_json_data(json_data)
+        
+        # Step 3: Post each chunk to Splunk
+        splunk_client = SplunkHECClient(splunk_url, hec_token)
+        for i, chunk in enumerate(json_chunks):
+            logging.info(f'Posting chunk {i+1} of {len(json_chunks)} to Splunk...')
+            splunk_client.post_to_splunk(chunk)
+            
+        logging.info('All chunks posted successfully.')
+    except Exception as e:
+        logging.error(f'Main execution failed: {e}')
+
+
+if __name__ == '__main__':
+    # Example usage
+    file_path = 'path/to/your/file.json'  # Replace with the path to your JSON file
+    splunk_url = 'https://splunk-url:8088'  # Replace with your Splunk HEC URL
+    hec_token = 'your_hec_token_here'  # Replace with your HEC token
+
+    main(file_path, splunk_url, hec_token)
